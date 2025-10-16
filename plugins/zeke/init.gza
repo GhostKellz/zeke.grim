@@ -1,0 +1,401 @@
+-- Zeke.grim - AI-powered coding assistant for Grim
+-- Main plugin entry point
+
+local api = require("runtime.api")
+local context = require("runtime.context")
+local ui = require("runtime.ui")
+local diff = require("runtime.diff")
+
+local M = {}
+
+-- Plugin state
+M.config = {}
+M.state = {
+    initialized = false,
+    chat_open = false,
+    current_model = nil,
+    context_files = {},
+    inline_suggestion = nil,
+}
+
+-- Initialize plugin
+function M.setup(user_config)
+    -- Merge user config with defaults from plugin.toml
+    M.config = vim.tbl_deep_extend("force", {
+        api_base = os.getenv("ZEKE_API_BASE") or "http://127.0.0.1:8080/v1",
+        ollama_host = os.getenv("OLLAMA_HOST") or "http://127.0.0.1:11434",
+        models = {
+            ["code-fast"] = "ollama:deepseek-coder:14b",
+            ["code-plus"] = "ollama:deepseek-coder:33b",
+            ["code-smart"] = "openai:gpt-4o-mini",
+            ["reason-deep"] = "anthropic:claude-sonnet-4-5-20250929",
+        },
+        providers = {
+            ollama = {
+                enabled = true,
+                api_base = os.getenv("OLLAMA_HOST") or "http://127.0.0.1:11434",
+            },
+            openai = {
+                enabled = true,
+                api_key = os.getenv("OPENAI_API_KEY"),
+                api_base = "https://api.openai.com/v1",
+            },
+            anthropic = {
+                enabled = true,
+                api_key = os.getenv("ANTHROPIC_API_KEY"),
+                api_base = "https://api.anthropic.com/v1",
+            },
+            azure = {
+                enabled = false,
+                api_key = os.getenv("AZURE_OPENAI_API_KEY"),
+                api_base = os.getenv("AZURE_OPENAI_ENDPOINT"),
+            },
+        },
+        ui = {
+            chat_position = "right",
+            chat_width = 50,
+            ghost_text_hl = "Comment",
+            show_inline_suggestions = true,
+        },
+        behavior = {
+            trigger_chars = {".", ":", "(", " "},
+            debounce_ms = 300,
+            max_tokens = 2048,
+            auto_complete = true,
+            stream_responses = true,
+        },
+        keymaps = {
+            chat_toggle = "<leader>ac",
+            chat_send = "<leader>as",
+            accept = "<Tab>",
+            next = "<C-]>",
+            prev = "<C-[>",
+            dismiss = "<C-\\>",
+            explain = "<leader>ae",
+            fix = "<leader>af",
+            refactor = "<leader>ar",
+            add_context = "<leader>aa",
+            clear_context = "<leader>ax",
+        },
+        logging = {
+            level = "INFO",
+            file = os.getenv("HOME") .. "/.local/share/grim/zeke.log",
+        },
+    }, user_config or {})
+
+    -- Set default model
+    M.state.current_model = "code-fast"
+
+    -- Initialize API client
+    api.init(M.config)
+
+    -- Initialize context manager
+    context.init(M.config)
+
+    -- Initialize UI
+    ui.init(M.config)
+
+    -- Register commands
+    M.register_commands()
+
+    -- Register keymaps
+    M.register_keymaps()
+
+    M.state.initialized = true
+    print("[zeke] AI assistant ready (model: " .. M.state.current_model .. ")")
+end
+
+-- Register commands
+function M.register_commands()
+    -- Chat commands
+    vim.api.nvim_create_user_command("ZekeChat", function(opts)
+        M.chat_command(opts.args)
+    end, { nargs = "*", desc = "Open Zeke chat panel" })
+
+    vim.api.nvim_create_user_command("ZekeSend", function()
+        M.send_selection()
+    end, { range = true, desc = "Send selection to Zeke" })
+
+    -- Editing commands
+    vim.api.nvim_create_user_command("ZekeExplain", function()
+        M.explain_code()
+    end, { range = true, desc = "Explain selected code" })
+
+    vim.api.nvim_create_user_command("ZekeFix", function()
+        M.fix_issue()
+    end, { desc = "Fix issue at cursor" })
+
+    vim.api.nvim_create_user_command("ZekeRefactor", function(opts)
+        M.refactor_code(opts.args)
+    end, { nargs = "+", range = true, desc = "Refactor code with instruction" })
+
+    -- Context commands
+    vim.api.nvim_create_user_command("ZekeAddFile", function(opts)
+        M.add_context_file(opts.args)
+    end, { nargs = "?", complete = "file", desc = "Add file to context" })
+
+    vim.api.nvim_create_user_command("ZekeShowContext", function()
+        M.show_context()
+    end, { desc = "Show current context" })
+
+    vim.api.nvim_create_user_command("ZekeClearContext", function()
+        M.clear_context()
+    end, { desc = "Clear context" })
+
+    -- Model commands
+    vim.api.nvim_create_user_command("ZekeModels", function()
+        M.list_models()
+    end, { desc = "List available models" })
+
+    vim.api.nvim_create_user_command("ZekeModel", function(opts)
+        M.switch_model(opts.args)
+    end, { nargs = 1, complete = M.model_complete, desc = "Switch model" })
+
+    -- Diagnostic commands
+    vim.api.nvim_create_user_command("ZekeDoctor", function()
+        M.doctor()
+    end, { desc = "Check Zeke health" })
+
+    vim.api.nvim_create_user_command("ZekeLogLevel", function(opts)
+        M.set_log_level(opts.args)
+    end, { nargs = 1, desc = "Set log level" })
+end
+
+-- Register keymaps
+function M.register_keymaps()
+    local km = M.config.keymaps
+
+    -- Chat panel
+    vim.keymap.set("n", km.chat_toggle, M.toggle_chat, { desc = "Zeke: Toggle chat" })
+    vim.keymap.set("v", km.chat_send, M.send_selection, { desc = "Zeke: Send selection" })
+
+    -- Inline completions (insert mode)
+    vim.keymap.set("i", km.accept, M.accept_suggestion, { desc = "Zeke: Accept suggestion" })
+    vim.keymap.set("i", km.next, M.next_suggestion, { desc = "Zeke: Next suggestion" })
+    vim.keymap.set("i", km.prev, M.prev_suggestion, { desc = "Zeke: Previous suggestion" })
+    vim.keymap.set("i", km.dismiss, M.dismiss_suggestion, { desc = "Zeke: Dismiss suggestion" })
+
+    -- Code commands
+    vim.keymap.set("v", km.explain, M.explain_code, { desc = "Zeke: Explain code" })
+    vim.keymap.set("n", km.fix, M.fix_issue, { desc = "Zeke: Fix issue" })
+    vim.keymap.set("v", km.refactor, function()
+        local instruction = vim.fn.input("Refactor instruction: ")
+        if instruction ~= "" then
+            M.refactor_code(instruction)
+        end
+    end, { desc = "Zeke: Refactor code" })
+
+    -- Context management
+    vim.keymap.set("n", km.add_context, M.add_current_file, { desc = "Zeke: Add current file to context" })
+    vim.keymap.set("n", km.clear_context, M.clear_context, { desc = "Zeke: Clear context" })
+end
+
+-- Chat command implementation
+function M.chat_command(message)
+    if not ui.is_chat_open() then
+        ui.open_chat()
+    end
+
+    if message and message ~= "" then
+        M.send_message(message)
+    end
+end
+
+-- Toggle chat panel
+function M.toggle_chat()
+    if ui.is_chat_open() then
+        ui.close_chat()
+    else
+        ui.open_chat()
+    end
+end
+
+-- Send message to AI
+function M.send_message(message)
+    local ctx = context.get_context()
+    local full_context = context.format_context(ctx)
+
+    ui.add_user_message(message)
+
+    -- Stream response
+    api.chat_completion({
+        model = M.state.current_model,
+        messages = {
+            { role = "system", content = "You are Zeke, an AI coding assistant integrated into the Grim editor." },
+            { role = "user", content = full_context .. "\n\n" .. message },
+        },
+        stream = M.config.behavior.stream_responses,
+        max_tokens = M.config.behavior.max_tokens,
+    }, function(chunk, done)
+        if done then
+            ui.finish_assistant_message()
+        else
+            ui.append_assistant_message(chunk)
+        end
+    end)
+end
+
+-- Send current selection
+function M.send_selection()
+    local selection = vim.fn.getline("'<", "'>")
+    local text = table.concat(selection, "\n")
+    M.send_message("Analyze this code:\n```\n" .. text .. "\n```")
+end
+
+-- Explain code
+function M.explain_code()
+    local selection = vim.fn.getline("'<", "'>")
+    local text = table.concat(selection, "\n")
+    M.send_message("Explain this code in detail:\n```\n" .. text .. "\n```")
+end
+
+-- Fix issue at cursor
+function M.fix_issue()
+    local diagnostics = vim.diagnostic.get(0, { lnum = vim.fn.line(".") - 1 })
+
+    if #diagnostics == 0 then
+        print("[zeke] No issues found at cursor")
+        return
+    end
+
+    local line = vim.fn.getline(".")
+    local issue_text = diagnostics[1].message
+
+    M.send_message(string.format(
+        "Fix this issue:\nCode: `%s`\nError: %s",
+        line, issue_text
+    ))
+end
+
+-- Refactor code
+function M.refactor_code(instruction)
+    local selection = vim.fn.getline("'<", "'>")
+    local text = table.concat(selection, "\n")
+
+    M.send_message(string.format(
+        "Refactor this code: %s\n\nOriginal code:\n```\n%s\n```\n\nProvide the refactored code in a unified diff format.",
+        instruction, text
+    ))
+end
+
+-- Add file to context
+function M.add_context_file(filepath)
+    if not filepath or filepath == "" then
+        filepath = vim.fn.expand("%:p")
+    end
+
+    context.add_file(filepath)
+    print("[zeke] Added to context: " .. filepath)
+end
+
+-- Add current file to context
+function M.add_current_file()
+    M.add_context_file(vim.fn.expand("%:p"))
+end
+
+-- Show current context
+function M.show_context()
+    local ctx = context.get_context()
+    print("[zeke] Context: " .. ctx.token_count .. " tokens, " .. #ctx.files .. " files")
+    for _, file in ipairs(ctx.files) do
+        print("  - " .. file.path)
+    end
+end
+
+-- Clear context
+function M.clear_context()
+    context.clear()
+    print("[zeke] Context cleared")
+end
+
+-- List available models
+function M.list_models()
+    print("[zeke] Available models:")
+    for alias, model in pairs(M.config.models) do
+        local current = (alias == M.state.current_model) and " (current)" or ""
+        print("  - " .. alias .. " = " .. model .. current)
+    end
+end
+
+-- Switch model
+function M.switch_model(alias)
+    if M.config.models[alias] then
+        M.state.current_model = alias
+        print("[zeke] Switched to model: " .. alias .. " (" .. M.config.models[alias] .. ")")
+    else
+        print("[zeke] Unknown model alias: " .. alias)
+    end
+end
+
+-- Model completion for command
+function M.model_complete()
+    local models = {}
+    for alias, _ in pairs(M.config.models) do
+        table.insert(models, alias)
+    end
+    return models
+end
+
+-- Inline suggestion handlers
+function M.accept_suggestion()
+    if M.state.inline_suggestion then
+        vim.api.nvim_put({M.state.inline_suggestion}, "c", true, true)
+        M.state.inline_suggestion = nil
+    end
+end
+
+function M.next_suggestion()
+    -- TODO: Cycle through multiple suggestions
+    print("[zeke] Next suggestion (not yet implemented)")
+end
+
+function M.prev_suggestion()
+    -- TODO: Cycle through multiple suggestions
+    print("[zeke] Previous suggestion (not yet implemented)")
+end
+
+function M.dismiss_suggestion()
+    M.state.inline_suggestion = nil
+    -- Clear ghost text
+    ui.clear_ghost_text()
+end
+
+-- Health check
+function M.doctor()
+    print("[zeke] Running health checks...")
+
+    -- Check API connectivity
+    local ok, err = api.health_check()
+    if ok then
+        print("  [✓] API reachable at " .. M.config.api_base)
+    else
+        print("  [✗] API not reachable: " .. (err or "unknown error"))
+    end
+
+    -- Check Ollama
+    if M.config.providers.ollama.enabled then
+        local ollama_ok = api.check_ollama()
+        if ollama_ok then
+            print("  [✓] Ollama available at " .. M.config.ollama_host)
+        else
+            print("  [✗] Ollama not available")
+        end
+    end
+
+    -- Check providers
+    for name, provider in pairs(M.config.providers) do
+        if provider.enabled and provider.api_key then
+            print("  [✓] " .. name .. " API key configured")
+        elseif provider.enabled then
+            print("  [!] " .. name .. " enabled but no API key")
+        end
+    end
+end
+
+-- Set log level
+function M.set_log_level(level)
+    M.config.logging.level = string.upper(level)
+    print("[zeke] Log level set to: " .. M.config.logging.level)
+end
+
+return M

@@ -1,0 +1,347 @@
+-- Zeke UI components - chat panel, inline suggestions, ghost text
+
+local M = {}
+local config = {}
+
+-- UI state
+local state = {
+    chat_buf = nil,
+    chat_win = nil,
+    chat_open = false,
+    chat_history = {},
+    ghost_text_ns = nil,
+    current_ghost_text = nil,
+}
+
+-- Initialize UI
+function M.init(user_config)
+    config = user_config
+    state.ghost_text_ns = vim.api.nvim_create_namespace("zeke_ghost_text")
+end
+
+-- Create chat buffer
+local function create_chat_buffer()
+    local buf = vim.api.nvim_create_buf(false, true)
+
+    -- Set buffer options
+    vim.api.nvim_buf_set_option(buf, "buftype", "nofile")
+    vim.api.nvim_buf_set_option(buf, "bufhidden", "hide")
+    vim.api.nvim_buf_set_option(buf, "swapfile", false)
+    vim.api.nvim_buf_set_option(buf, "filetype", "markdown")
+    vim.api.nvim_buf_set_name(buf, "Zeke Chat")
+
+    -- Set buffer keymaps
+    vim.api.nvim_buf_set_keymap(buf, "n", "q", ":ZekeChat<CR>", {
+        noremap = true,
+        silent = true,
+        desc = "Close Zeke chat",
+    })
+
+    return buf
+end
+
+-- Open chat window
+local function open_chat_window(buf)
+    local position = config.ui.chat_position or "right"
+    local width = config.ui.chat_width or 50
+
+    local win_config = {}
+
+    if position == "right" then
+        vim.cmd("vsplit")
+        vim.cmd("wincmd L")
+        win_config.width = width
+    elseif position == "left" then
+        vim.cmd("vsplit")
+        vim.cmd("wincmd H")
+        win_config.width = width
+    elseif position == "bottom" then
+        vim.cmd("split")
+        vim.cmd("wincmd J")
+        win_config.height = 15
+    end
+
+    local win = vim.api.nvim_get_current_win()
+    vim.api.nvim_win_set_buf(win, buf)
+
+    -- Set window options
+    vim.api.nvim_win_set_option(win, "wrap", true)
+    vim.api.nvim_win_set_option(win, "linebreak", true)
+    vim.api.nvim_win_set_option(win, "number", false)
+    vim.api.nvim_win_set_option(win, "relativenumber", false)
+
+    return win
+end
+
+-- Open chat panel
+function M.open_chat()
+    if state.chat_open then
+        return
+    end
+
+    -- Create buffer if doesn't exist
+    if not state.chat_buf or not vim.api.nvim_buf_is_valid(state.chat_buf) then
+        state.chat_buf = create_chat_buffer()
+
+        -- Add welcome message
+        local welcome = {
+            "# Zeke AI Assistant",
+            "",
+            "Ask me anything about your code!",
+            "",
+            "Commands:",
+            "- `:ZekeChat <message>` - Send a message",
+            "- `:ZekeExplain` - Explain selected code",
+            "- `:ZekeFix` - Fix issue at cursor",
+            "- `:ZekeRefactor <instruction>` - Refactor code",
+            "",
+            "Press `q` to close this panel.",
+            "",
+            "---",
+            "",
+        }
+
+        vim.api.nvim_buf_set_lines(state.chat_buf, 0, -1, false, welcome)
+        state.chat_history = welcome
+    end
+
+    -- Open window
+    state.chat_win = open_chat_window(state.chat_buf)
+    state.chat_open = true
+end
+
+-- Close chat panel
+function M.close_chat()
+    if not state.chat_open then
+        return
+    end
+
+    if state.chat_win and vim.api.nvim_win_is_valid(state.chat_win) then
+        vim.api.nvim_win_close(state.chat_win, false)
+    end
+
+    state.chat_win = nil
+    state.chat_open = false
+end
+
+-- Check if chat is open
+function M.is_chat_open()
+    return state.chat_open and state.chat_win and vim.api.nvim_win_is_valid(state.chat_win)
+end
+
+-- Add user message to chat
+function M.add_user_message(message)
+    if not state.chat_buf or not vim.api.nvim_buf_is_valid(state.chat_buf) then
+        return
+    end
+
+    local lines = {
+        "",
+        "## You",
+        "",
+        message,
+        "",
+        "## Zeke",
+        "",
+    }
+
+    -- Append to buffer
+    local line_count = vim.api.nvim_buf_line_count(state.chat_buf)
+    vim.api.nvim_buf_set_lines(state.chat_buf, line_count, line_count, false, lines)
+
+    for _, line in ipairs(lines) do
+        table.insert(state.chat_history, line)
+    end
+
+    -- Scroll to bottom
+    if M.is_chat_open() then
+        local new_line_count = vim.api.nvim_buf_line_count(state.chat_buf)
+        vim.api.nvim_win_set_cursor(state.chat_win, {new_line_count, 0})
+    end
+end
+
+-- Append to assistant message (for streaming)
+function M.append_assistant_message(chunk)
+    if not state.chat_buf or not vim.api.nvim_buf_is_valid(state.chat_buf) then
+        return
+    end
+
+    -- Get last line
+    local line_count = vim.api.nvim_buf_line_count(state.chat_buf)
+    local last_line = vim.api.nvim_buf_get_lines(state.chat_buf, line_count - 1, line_count, false)[1]
+
+    -- Append chunk to last line
+    local new_line = last_line .. chunk
+
+    -- Update buffer
+    vim.api.nvim_buf_set_lines(state.chat_buf, line_count - 1, line_count, false, {new_line})
+
+    -- Update history
+    state.chat_history[#state.chat_history] = new_line
+
+    -- Scroll to bottom
+    if M.is_chat_open() then
+        vim.api.nvim_win_set_cursor(state.chat_win, {line_count, #new_line})
+    end
+end
+
+-- Finish assistant message
+function M.finish_assistant_message()
+    if not state.chat_buf or not vim.api.nvim_buf_is_valid(state.chat_buf) then
+        return
+    end
+
+    -- Add separator
+    local line_count = vim.api.nvim_buf_line_count(state.chat_buf)
+    vim.api.nvim_buf_set_lines(state.chat_buf, line_count, line_count, false, {"", "---", ""})
+
+    table.insert(state.chat_history, "")
+    table.insert(state.chat_history, "---")
+    table.insert(state.chat_history, "")
+end
+
+-- Clear chat history
+function M.clear_chat()
+    if not state.chat_buf or not vim.api.nvim_buf_is_valid(state.chat_buf) then
+        return
+    end
+
+    vim.api.nvim_buf_set_lines(state.chat_buf, 0, -1, false, {})
+    state.chat_history = {}
+end
+
+-- Show inline ghost text suggestion
+function M.show_ghost_text(text)
+    local bufnr = vim.api.nvim_get_current_buf()
+    local cursor = vim.api.nvim_win_get_cursor(0)
+    local row = cursor[1] - 1
+    local col = cursor[2]
+
+    -- Clear existing ghost text
+    M.clear_ghost_text()
+
+    -- Create virtual text
+    local opts = {
+        virt_text = {{text, config.ui.ghost_text_hl or "Comment"}},
+        virt_text_pos = "overlay",
+        hl_mode = "combine",
+    }
+
+    local extmark_id = vim.api.nvim_buf_set_extmark(bufnr, state.ghost_text_ns, row, col, opts)
+    state.current_ghost_text = {
+        bufnr = bufnr,
+        extmark_id = extmark_id,
+        text = text,
+    }
+end
+
+-- Clear ghost text
+function M.clear_ghost_text()
+    if state.current_ghost_text then
+        local bufnr = state.current_ghost_text.bufnr
+        if vim.api.nvim_buf_is_valid(bufnr) then
+            vim.api.nvim_buf_del_extmark(bufnr, state.ghost_text_ns, state.current_ghost_text.extmark_id)
+        end
+        state.current_ghost_text = nil
+    end
+end
+
+-- Show notification
+function M.notify(message, level)
+    level = level or vim.log.levels.INFO
+    vim.notify("[zeke] " .. message, level)
+end
+
+-- Show error
+function M.error(message)
+    M.notify(message, vim.log.levels.ERROR)
+end
+
+-- Show warning
+function M.warn(message)
+    M.notify(message, vim.log.levels.WARN)
+end
+
+-- Show info
+function M.info(message)
+    M.notify(message, vim.log.levels.INFO)
+end
+
+-- Create floating window for diff preview
+function M.show_diff_preview(original, modified)
+    -- Create buffer with diff
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_option(buf, "buftype", "nofile")
+    vim.api.nvim_buf_set_option(buf, "filetype", "diff")
+
+    -- Create diff text
+    local diff_lines = vim.fn.systemlist("diff -u", {original, modified})
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, diff_lines)
+
+    -- Calculate window size
+    local width = math.floor(vim.o.columns * 0.8)
+    local height = math.floor(vim.o.lines * 0.8)
+    local row = math.floor((vim.o.lines - height) / 2)
+    local col = math.floor((vim.o.columns - width) / 2)
+
+    -- Create floating window
+    local win = vim.api.nvim_open_win(buf, true, {
+        relative = "editor",
+        width = width,
+        height = height,
+        row = row,
+        col = col,
+        style = "minimal",
+        border = "rounded",
+        title = " Diff Preview ",
+        title_pos = "center",
+    })
+
+    -- Set keymaps
+    vim.api.nvim_buf_set_keymap(buf, "n", "q", ":close<CR>", {
+        noremap = true,
+        silent = true,
+        desc = "Close diff preview",
+    })
+
+    vim.api.nvim_buf_set_keymap(buf, "n", "<Esc>", ":close<CR>", {
+        noremap = true,
+        silent = true,
+        desc = "Close diff preview",
+    })
+
+    return buf, win
+end
+
+-- Show loading indicator
+function M.show_loading(message)
+    message = message or "Loading..."
+    M.info(message)
+end
+
+-- Hide loading indicator
+function M.hide_loading()
+    -- Clear any loading messages
+end
+
+-- Get chat history
+function M.get_chat_history()
+    return state.chat_history
+end
+
+-- Export chat history
+function M.export_chat_history(filepath)
+    local file = io.open(filepath, "w")
+    if not file then
+        M.error("Failed to export chat history: " .. filepath)
+        return false
+    end
+
+    file:write(table.concat(state.chat_history, "\n"))
+    file:close()
+
+    M.info("Chat history exported to: " .. filepath)
+    return true
+end
+
+return M

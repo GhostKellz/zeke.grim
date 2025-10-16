@@ -1,0 +1,340 @@
+-- Zeke API client - OpenAI-compatible chat completions with SSE streaming
+-- Supports Ollama, OpenAI, Anthropic, Azure OpenAI via unified interface
+
+local M = {}
+local config = {}
+
+-- Initialize API client
+function M.init(user_config)
+    config = user_config
+end
+
+-- Parse provider and model from alias
+local function parse_model(alias)
+    local cfg = config.models[alias]
+    if not cfg then
+        return "ollama", alias
+    end
+
+    -- Format: "provider:model"
+    local provider, model = cfg:match("([^:]+):(.+)")
+    if not provider or not model then
+        return "ollama", cfg
+    end
+
+    return provider, model
+end
+
+-- Get API endpoint and auth for provider
+local function get_provider_config(provider)
+    local provider_cfg = config.providers[provider]
+    if not provider_cfg or not provider_cfg.enabled then
+        return nil, "Provider " .. provider .. " not enabled"
+    end
+
+    local api_base = provider_cfg.api_base
+
+    -- Special handling for Ollama (uses different endpoint)
+    if provider == "ollama" then
+        api_base = config.ollama_host
+    end
+
+    local headers = {
+        ["Content-Type"] = "application/json",
+    }
+
+    -- Add auth header if API key exists
+    if provider_cfg.api_key and provider_cfg.api_key ~= "" then
+        if provider == "anthropic" then
+            headers["x-api-key"] = provider_cfg.api_key
+            headers["anthropic-version"] = "2023-06-01"
+        else
+            headers["Authorization"] = "Bearer " .. provider_cfg.api_key
+        end
+    end
+
+    return {
+        api_base = api_base,
+        headers = headers,
+    }, nil
+end
+
+-- Format request for provider
+local function format_request(provider, model, messages, options)
+    local req = {
+        model = model,
+        messages = messages,
+        stream = options.stream or false,
+        max_tokens = options.max_tokens or 2048,
+    }
+
+    -- Provider-specific formatting
+    if provider == "anthropic" then
+        -- Anthropic uses "max_tokens" not "max_completion_tokens"
+        req.max_tokens = options.max_tokens or 2048
+    elseif provider == "ollama" then
+        -- Ollama may need different field names
+        req.options = {
+            num_predict = options.max_tokens or 2048,
+        }
+    end
+
+    return req
+end
+
+-- HTTP request helper
+local function http_request(method, url, headers, body)
+    -- Use grim's HTTP client (via core.http or ffi)
+    -- This is a placeholder - actual implementation depends on grim's HTTP API
+    local curl_cmd = "curl -s -X " .. method
+
+    -- Add headers
+    for key, value in pairs(headers) do
+        curl_cmd = curl_cmd .. " -H '" .. key .. ": " .. value .. "'"
+    end
+
+    -- Add body
+    if body then
+        local json_body = vim.fn.json_encode(body)
+        curl_cmd = curl_cmd .. " -d '" .. json_body .. "'"
+    end
+
+    curl_cmd = curl_cmd .. " '" .. url .. "'"
+
+    -- Execute curl
+    local handle = io.popen(curl_cmd)
+    local result = handle:read("*a")
+    handle:close()
+
+    return result
+end
+
+-- Stream HTTP request helper (SSE)
+local function http_stream(method, url, headers, body, callback)
+    -- For streaming, we need to read line-by-line
+    local curl_cmd = "curl -s -N -X " .. method
+
+    -- Add headers
+    for key, value in pairs(headers) do
+        curl_cmd = curl_cmd .. " -H '" .. key .. ": " .. value .. "'"
+    end
+
+    -- Add body
+    if body then
+        local json_body = vim.fn.json_encode(body)
+        curl_cmd = curl_cmd .. " -d '" .. json_body .. "'"
+    end
+
+    curl_cmd = curl_cmd .. " '" .. url .. "'"
+
+    -- Stream response line by line
+    local handle = io.popen(curl_cmd)
+    if not handle then
+        callback(nil, true)
+        return
+    end
+
+    for line in handle:lines() do
+        if line:match("^data: ") then
+            local json_data = line:sub(7) -- Remove "data: " prefix
+
+            if json_data == "[DONE]" then
+                callback(nil, true)
+                break
+            end
+
+            -- Parse JSON chunk
+            local ok, chunk = pcall(vim.fn.json_decode, json_data)
+            if ok and chunk then
+                -- Extract content from chunk
+                local content = nil
+                if chunk.choices and chunk.choices[1] then
+                    local delta = chunk.choices[1].delta
+                    if delta and delta.content then
+                        content = delta.content
+                    end
+                end
+
+                if content then
+                    callback(content, false)
+                end
+            end
+        end
+    end
+
+    handle:close()
+    callback(nil, true)
+end
+
+-- Chat completion request
+function M.chat_completion(options, callback)
+    local model_alias = options.model or "code-fast"
+    local provider, model = parse_model(model_alias)
+
+    local provider_config, err = get_provider_config(provider)
+    if not provider_config then
+        if callback then
+            callback(nil, true)
+        end
+        print("[zeke] API error: " .. (err or "unknown"))
+        return
+    end
+
+    local endpoint = provider_config.api_base .. "/chat/completions"
+    if provider == "ollama" then
+        endpoint = provider_config.api_base .. "/api/chat"
+    end
+
+    local request = format_request(provider, model, options.messages, options)
+
+    if options.stream and callback then
+        -- Streaming request
+        http_stream("POST", endpoint, provider_config.headers, request, callback)
+    else
+        -- Non-streaming request
+        local response = http_request("POST", endpoint, provider_config.headers, request)
+
+        if not response then
+            if callback then
+                callback(nil, true)
+            end
+            return nil
+        end
+
+        local ok, data = pcall(vim.fn.json_decode, response)
+        if ok and data and data.choices and data.choices[1] then
+            local content = data.choices[1].message.content
+            if callback then
+                callback(content, true)
+            end
+            return content
+        else
+            if callback then
+                callback(nil, true)
+            end
+            return nil
+        end
+    end
+end
+
+-- Health check - ping API
+function M.health_check()
+    local provider_config, err = get_provider_config("ollama")
+    if not provider_config then
+        return false, err
+    end
+
+    -- Try to list models as a health check
+    local endpoint = config.ollama_host .. "/api/tags"
+    local response = http_request("GET", endpoint, {}, nil)
+
+    if response and response ~= "" then
+        return true, nil
+    else
+        return false, "No response from API"
+    end
+end
+
+-- Check if Ollama is available
+function M.check_ollama()
+    if not config.providers.ollama.enabled then
+        return false
+    end
+
+    local endpoint = config.ollama_host .. "/api/tags"
+    local response = http_request("GET", endpoint, {}, nil)
+
+    if response and response ~= "" then
+        return true
+    else
+        return false
+    end
+end
+
+-- List available models from Ollama
+function M.list_ollama_models()
+    if not config.providers.ollama.enabled then
+        return {}
+    end
+
+    local endpoint = config.ollama_host .. "/api/tags"
+    local response = http_request("GET", endpoint, {}, nil)
+
+    if not response or response == "" then
+        return {}
+    end
+
+    local ok, data = pcall(vim.fn.json_decode, response)
+    if ok and data and data.models then
+        return data.models
+    else
+        return {}
+    end
+end
+
+-- Retry logic with exponential backoff
+local function retry_request(fn, max_retries, initial_delay)
+    max_retries = max_retries or 3
+    initial_delay = initial_delay or 1000
+
+    local attempt = 0
+    local delay = initial_delay
+
+    while attempt < max_retries do
+        local ok, result = pcall(fn)
+        if ok then
+            return result
+        end
+
+        attempt = attempt + 1
+        if attempt < max_retries then
+            -- Wait with jitter
+            local jitter = math.random(0, delay / 2)
+            vim.wait(delay + jitter)
+            delay = delay * 2
+        end
+    end
+
+    return nil
+end
+
+-- Error taxonomy
+M.ErrorType = {
+    NETWORK = "network",
+    AUTH = "auth",
+    RATE_LIMIT = "rate_limit",
+    TIMEOUT = "timeout",
+    INVALID_REQUEST = "invalid_request",
+    SERVER_ERROR = "server_error",
+    UNKNOWN = "unknown",
+}
+
+-- Parse error from response
+function M.parse_error(response)
+    local ok, data = pcall(vim.fn.json_decode, response)
+    if not ok then
+        return M.ErrorType.UNKNOWN, "Failed to parse error response"
+    end
+
+    if data.error then
+        local error_msg = data.error.message or "Unknown error"
+        local error_type = data.error.type or M.ErrorType.UNKNOWN
+
+        -- Map common error types
+        if error_msg:match("authentication") or error_msg:match("api key") then
+            return M.ErrorType.AUTH, error_msg
+        elseif error_msg:match("rate limit") then
+            return M.ErrorType.RATE_LIMIT, error_msg
+        elseif error_msg:match("timeout") then
+            return M.ErrorType.TIMEOUT, error_msg
+        elseif error_type == "invalid_request_error" then
+            return M.ErrorType.INVALID_REQUEST, error_msg
+        else
+            return M.ErrorType.SERVER_ERROR, error_msg
+        end
+    end
+
+    return M.ErrorType.UNKNOWN, "Unknown error"
+end
+
+return M

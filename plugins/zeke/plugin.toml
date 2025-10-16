@@ -1,0 +1,89 @@
+[plugin]
+name = "zeke"
+version = "0.1.0"
+description = "AI-powered coding assistant for Grim with Ollama-first, multi-provider support"
+author = "ghostkellz"
+license = "MIT"
+main = "init.gza"
+repository = "https://github.com/ghostkellz/zeke.grim"
+
+[dependencies]
+# Minimum grim version required
+grim = ">=0.1.0"
+
+[optimize]
+# Hot functions implemented in Zig for performance
+hot_functions = ["apply_patch", "pack_context", "token_count"]
+compile_on_install = true
+prefer_binary = true
+
+[config]
+# Default configuration values
+api_base = "${ZEKE_API_BASE:-http://127.0.0.1:8080/v1}"
+ollama_host = "${OLLAMA_HOST:-http://127.0.0.1:11434}"
+
+# Model aliases
+[config.models]
+code-fast = "ollama:deepseek-coder:14b"
+code-plus = "ollama:deepseek-coder:33b"
+code-smart = "openai:gpt-4o-mini"
+reason-deep = "anthropic:claude-sonnet-4-5-20250929"
+
+# Provider configuration
+[config.providers.ollama]
+enabled = true
+api_base = "${OLLAMA_HOST:-http://127.0.0.1:11434}"
+
+[config.providers.openai]
+enabled = true
+api_key = "${OPENAI_API_KEY}"
+api_base = "https://api.openai.com/v1"
+
+[config.providers.anthropic]
+enabled = true
+api_key = "${ANTHROPIC_API_KEY}"
+api_base = "https://api.anthropic.com/v1"
+
+[config.providers.azure]
+enabled = false
+api_key = "${AZURE_OPENAI_API_KEY}"
+api_base = "${AZURE_OPENAI_ENDPOINT}"
+
+# UI configuration
+[config.ui]
+chat_position = "right"  # "left", "right", "bottom"
+chat_width = 50
+ghost_text_hl = "Comment"
+show_inline_suggestions = true
+
+# Behavior configuration
+[config.behavior]
+trigger_chars = [".", ":", "(", " "]
+debounce_ms = 300
+max_tokens = 2048
+auto_complete = true
+stream_responses = true
+
+# Keybindings
+[config.keymaps]
+# Chat panel
+chat_toggle = "<leader>ac"
+chat_send = "<leader>as"
+
+# Inline completions
+accept = "<Tab>"
+next = "<C-]>"
+prev = "<C-[>"
+dismiss = "<C-\\>"
+
+# Commands
+explain = "<leader>ae"
+fix = "<leader>af"
+refactor = "<leader>ar"
+add_context = "<leader>aa"
+clear_context = "<leader>ax"
+
+# Logging
+[config.logging]
+level = "INFO"  # DEBUG, INFO, WARN, ERROR
+file = "${HOME}/.local/share/grim/zeke.log"

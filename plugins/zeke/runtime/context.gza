@@ -1,0 +1,308 @@
+-- Zeke context manager - handles file context, token counting, and truncation
+
+local M = {}
+local config = {}
+
+-- Context state
+local context_state = {
+    files = {},
+    selections = {},
+    token_count = 0,
+    max_tokens = 8000, -- Default context window
+}
+
+-- Initialize context manager
+function M.init(user_config)
+    config = user_config
+    context_state.max_tokens = user_config.behavior.max_tokens * 3 -- 3x for context window
+end
+
+-- Approximate token count (rough estimation: 1 token ≈ 4 chars)
+local function estimate_tokens(text)
+    return math.ceil(#text / 4)
+end
+
+-- Read file contents
+local function read_file(filepath)
+    local file = io.open(filepath, "r")
+    if not file then
+        return nil, "Failed to open file: " .. filepath
+    end
+
+    local content = file:read("*a")
+    file:close()
+
+    return content, nil
+end
+
+-- Get file language/extension
+local function get_file_language(filepath)
+    local ext = filepath:match("%.([^%.]+)$")
+    if not ext then
+        return "text"
+    end
+
+    -- Map extensions to language names
+    local lang_map = {
+        zig = "zig",
+        gza = "ghostlang",
+        lua = "lua",
+        js = "javascript",
+        ts = "typescript",
+        py = "python",
+        rs = "rust",
+        go = "go",
+        c = "c",
+        cpp = "cpp",
+        h = "c",
+        hpp = "cpp",
+        java = "java",
+        rb = "ruby",
+        sh = "bash",
+        md = "markdown",
+        json = "json",
+        toml = "toml",
+        yaml = "yaml",
+        xml = "xml",
+        html = "html",
+        css = "css",
+    }
+
+    return lang_map[ext] or ext
+end
+
+-- Add file to context
+function M.add_file(filepath)
+    -- Check if file already in context
+    for _, file in ipairs(context_state.files) do
+        if file.path == filepath then
+            return -- Already added
+        end
+    end
+
+    -- Read file contents
+    local content, err = read_file(filepath)
+    if not content then
+        print("[zeke] " .. err)
+        return
+    end
+
+    local tokens = estimate_tokens(content)
+    local language = get_file_language(filepath)
+
+    -- Add to context
+    table.insert(context_state.files, {
+        path = filepath,
+        content = content,
+        tokens = tokens,
+        language = language,
+    })
+
+    -- Update total token count
+    context_state.token_count = context_state.token_count + tokens
+
+    -- Truncate if needed
+    M.truncate_if_needed()
+end
+
+-- Add current buffer
+function M.add_current_buffer()
+    local filepath = vim.fn.expand("%:p")
+    M.add_file(filepath)
+end
+
+-- Add selection with context lines
+function M.add_selection(start_line, end_line, context_lines)
+    context_lines = context_lines or 5
+
+    local bufnr = vim.api.nvim_get_current_buf()
+    local filepath = vim.api.nvim_buf_get_name(bufnr)
+
+    -- Get extended range with context
+    local actual_start = math.max(1, start_line - context_lines)
+    local line_count = vim.api.nvim_buf_line_count(bufnr)
+    local actual_end = math.min(line_count, end_line + context_lines)
+
+    -- Get lines
+    local lines = vim.api.nvim_buf_get_lines(bufnr, actual_start - 1, actual_end, false)
+    local content = table.concat(lines, "\n")
+
+    local tokens = estimate_tokens(content)
+    local language = get_file_language(filepath)
+
+    table.insert(context_state.selections, {
+        filepath = filepath,
+        start_line = start_line,
+        end_line = end_line,
+        content = content,
+        tokens = tokens,
+        language = language,
+    })
+
+    context_state.token_count = context_state.token_count + tokens
+
+    M.truncate_if_needed()
+end
+
+-- Remove file from context
+function M.remove_file(filepath)
+    for i, file in ipairs(context_state.files) do
+        if file.path == filepath then
+            context_state.token_count = context_state.token_count - file.tokens
+            table.remove(context_state.files, i)
+            return
+        end
+    end
+end
+
+-- Clear context
+function M.clear()
+    context_state.files = {}
+    context_state.selections = {}
+    context_state.token_count = 0
+end
+
+-- Get current context
+function M.get_context()
+    return {
+        files = context_state.files,
+        selections = context_state.selections,
+        token_count = context_state.token_count,
+        max_tokens = context_state.max_tokens,
+    }
+end
+
+-- Format context for API request
+function M.format_context(ctx)
+    local parts = {}
+
+    -- Add files
+    if #ctx.files > 0 then
+        table.insert(parts, "## Context Files\n")
+        for _, file in ipairs(ctx.files) do
+            table.insert(parts, string.format(
+                "### %s\n```%s\n%s\n```\n",
+                file.path, file.language, file.content
+            ))
+        end
+    end
+
+    -- Add selections
+    if #ctx.selections > 0 then
+        table.insert(parts, "## Code Selections\n")
+        for _, sel in ipairs(ctx.selections) do
+            table.insert(parts, string.format(
+                "### %s (lines %d-%d)\n```%s\n%s\n```\n",
+                sel.filepath, sel.start_line, sel.end_line, sel.language, sel.content
+            ))
+        end
+    end
+
+    return table.concat(parts, "\n")
+end
+
+-- Truncate context if over token limit
+function M.truncate_if_needed()
+    if context_state.token_count <= context_state.max_tokens then
+        return
+    end
+
+    -- Remove oldest files first (FIFO)
+    while context_state.token_count > context_state.max_tokens and #context_state.files > 0 do
+        local removed = table.remove(context_state.files, 1)
+        context_state.token_count = context_state.token_count - removed.tokens
+        print("[zeke] Removed file from context (token limit): " .. removed.path)
+    end
+
+    -- If still over limit, remove selections
+    while context_state.token_count > context_state.max_tokens and #context_state.selections > 0 do
+        local removed = table.remove(context_state.selections, 1)
+        context_state.token_count = context_state.token_count - removed.tokens
+        print("[zeke] Removed selection from context (token limit)")
+    end
+end
+
+-- Smart context packing - add relevant files based on imports/references
+function M.smart_add_file(filepath)
+    -- Add the main file
+    M.add_file(filepath)
+
+    -- Read file and find imports
+    local content, err = read_file(filepath)
+    if not content then
+        return
+    end
+
+    -- Parse imports/requires (simple pattern matching)
+    local imports = {}
+
+    -- Zig imports: @import("path")
+    for import_path in content:gmatch('@import%("([^"]+)"%') do
+        table.insert(imports, import_path)
+    end
+
+    -- Ghostlang/Lua requires: require("path")
+    for require_path in content:gmatch('require%("([^"]+)"%') do
+        table.insert(imports, require_path)
+    end
+
+    -- TODO: Resolve import paths and add those files too
+    -- This would need filesystem resolution logic
+end
+
+-- Get context summary
+function M.get_summary()
+    return {
+        files = #context_state.files,
+        selections = #context_state.selections,
+        tokens = context_state.token_count,
+        max_tokens = context_state.max_tokens,
+        percentage = math.floor((context_state.token_count / context_state.max_tokens) * 100),
+    }
+end
+
+-- Pack context efficiently (can be overridden by Zig implementation)
+function M.pack_context(files)
+    local packed = {}
+
+    for _, file in ipairs(files) do
+        local content, err = read_file(file)
+        if content then
+            table.insert(packed, {
+                path = file,
+                content = content,
+                tokens = estimate_tokens(content),
+            })
+        end
+    end
+
+    return packed
+end
+
+-- Check if context is empty
+function M.is_empty()
+    return #context_state.files == 0 and #context_state.selections == 0
+end
+
+-- Get context size in bytes
+function M.get_size_bytes()
+    local total = 0
+
+    for _, file in ipairs(context_state.files) do
+        total = total + #file.content
+    end
+
+    for _, sel in ipairs(context_state.selections) do
+        total = total + #sel.content
+    end
+
+    return total
+end
+
+-- Set max token limit
+function M.set_max_tokens(max_tokens)
+    context_state.max_tokens = max_tokens
+    M.truncate_if_needed()
+end
+
+return M

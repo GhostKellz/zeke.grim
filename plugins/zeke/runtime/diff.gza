@@ -1,0 +1,388 @@
+-- Zeke diff/patch handler - build unified diffs, preview, and apply patches
+
+local M = {}
+local config = {}
+
+-- Initialize diff handler
+function M.init(user_config)
+    config = user_config
+end
+
+-- Create backup of file
+local function create_backup(filepath)
+    local backup_path = filepath .. ".zeke.bak"
+
+    -- Read original file
+    local file = io.open(filepath, "r")
+    if not file then
+        return nil, "Failed to open file: " .. filepath
+    end
+
+    local content = file:read("*a")
+    file:close()
+
+    -- Write backup
+    local backup = io.open(backup_path, "w")
+    if not backup then
+        return nil, "Failed to create backup: " .. backup_path
+    end
+
+    backup:write(content)
+    backup:close()
+
+    return backup_path, nil
+end
+
+-- Restore from backup
+local function restore_backup(filepath)
+    local backup_path = filepath .. ".zeke.bak"
+
+    -- Check if backup exists
+    local backup = io.open(backup_path, "r")
+    if not backup then
+        return false, "No backup found: " .. backup_path
+    end
+
+    local content = backup:read("*a")
+    backup:close()
+
+    -- Write to original file
+    local file = io.open(filepath, "w")
+    if not file then
+        return false, "Failed to restore file: " .. filepath
+    end
+
+    file:write(content)
+    file:close()
+
+    -- Remove backup
+    os.remove(backup_path)
+
+    return true, nil
+end
+
+-- Delete backup
+local function delete_backup(filepath)
+    local backup_path = filepath .. ".zeke.bak"
+    os.remove(backup_path)
+end
+
+-- Generate unified diff
+function M.create_diff(original_file, modified_file)
+    -- Use system diff command
+    local cmd = string.format("diff -u %s %s", original_file, modified_file)
+    local handle = io.popen(cmd)
+
+    if not handle then
+        return nil, "Failed to run diff command"
+    end
+
+    local diff = handle:read("*a")
+    handle:close()
+
+    return diff, nil
+end
+
+-- Generate diff from strings
+function M.create_diff_from_strings(original, modified, filename)
+    filename = filename or "file"
+
+    -- Write to temp files
+    local temp_dir = "/tmp"
+    local original_file = temp_dir .. "/zeke_original_" .. os.time()
+    local modified_file = temp_dir .. "/zeke_modified_" .. os.time()
+
+    -- Write original
+    local f1 = io.open(original_file, "w")
+    if not f1 then
+        return nil, "Failed to create temp file"
+    end
+    f1:write(original)
+    f1:close()
+
+    -- Write modified
+    local f2 = io.open(modified_file, "w")
+    if not f2 then
+        os.remove(original_file)
+        return nil, "Failed to create temp file"
+    end
+    f2:write(modified)
+    f2:close()
+
+    -- Generate diff
+    local diff, err = M.create_diff(original_file, modified_file)
+
+    -- Cleanup
+    os.remove(original_file)
+    os.remove(modified_file)
+
+    return diff, err
+end
+
+-- Parse unified diff
+function M.parse_diff(diff_text)
+    local hunks = {}
+    local current_hunk = nil
+
+    for line in diff_text:gmatch("[^\r\n]+") do
+        -- Parse hunk header: @@ -start,count +start,count @@
+        local old_start, old_count, new_start, new_count = line:match("@@%s*%-(%d+),(%d+)%s*%+(%d+),(%d+)%s*@@")
+
+        if old_start then
+            -- New hunk
+            if current_hunk then
+                table.insert(hunks, current_hunk)
+            end
+
+            current_hunk = {
+                old_start = tonumber(old_start),
+                old_count = tonumber(old_count),
+                new_start = tonumber(new_start),
+                new_count = tonumber(new_count),
+                lines = {},
+            }
+        elseif current_hunk then
+            -- Add line to current hunk
+            table.insert(current_hunk.lines, line)
+        end
+    end
+
+    if current_hunk then
+        table.insert(hunks, current_hunk)
+    end
+
+    return hunks
+end
+
+-- Apply patch to file
+function M.apply_patch(filepath, patch_text)
+    -- Create backup first
+    local backup_path, err = create_backup(filepath)
+    if not backup_path then
+        return false, err
+    end
+
+    -- Write patch to temp file
+    local temp_patch = "/tmp/zeke_patch_" .. os.time() .. ".patch"
+    local patch_file = io.open(temp_patch, "w")
+    if not patch_file then
+        delete_backup(filepath)
+        return false, "Failed to create temp patch file"
+    end
+
+    patch_file:write(patch_text)
+    patch_file:close()
+
+    -- Apply patch using system patch command
+    local cmd = string.format("patch %s < %s", filepath, temp_patch)
+    local result = os.execute(cmd)
+
+    -- Cleanup temp patch
+    os.remove(temp_patch)
+
+    if result == 0 then
+        -- Success - delete backup
+        delete_backup(filepath)
+        return true, nil
+    else
+        -- Failure - restore from backup
+        restore_backup(filepath)
+        return false, "Failed to apply patch"
+    end
+end
+
+-- Apply diff to buffer
+function M.apply_diff_to_buffer(bufnr, diff_text)
+    local hunks = M.parse_diff(diff_text)
+
+    if #hunks == 0 then
+        return false, "No valid hunks in diff"
+    end
+
+    -- Apply hunks in reverse order (to maintain line numbers)
+    for i = #hunks, 1, -1 do
+        local hunk = hunks[i]
+        local new_lines = {}
+
+        -- Extract new lines from hunk (lines starting with + or space)
+        for _, line in ipairs(hunk.lines) do
+            if line:sub(1, 1) == "+" then
+                table.insert(new_lines, line:sub(2)) -- Remove +
+            elseif line:sub(1, 1) == " " then
+                table.insert(new_lines, line:sub(2)) -- Remove space
+            end
+        end
+
+        -- Replace lines in buffer
+        local start_line = hunk.old_start - 1
+        local end_line = start_line + hunk.old_count
+
+        vim.api.nvim_buf_set_lines(bufnr, start_line, end_line, false, new_lines)
+    end
+
+    return true, nil
+end
+
+-- Preview diff in split window
+function M.preview_diff(diff_text)
+    -- Create temp buffer
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_option(buf, "buftype", "nofile")
+    vim.api.nvim_buf_set_option(buf, "filetype", "diff")
+    vim.api.nvim_buf_set_option(buf, "bufhidden", "wipe")
+
+    -- Split diff into lines
+    local lines = {}
+    for line in diff_text:gmatch("[^\r\n]+") do
+        table.insert(lines, line)
+    end
+
+    -- Set buffer content
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+
+    -- Open in split
+    vim.cmd("split")
+    local win = vim.api.nvim_get_current_win()
+    vim.api.nvim_win_set_buf(win, buf)
+    vim.api.nvim_win_set_height(win, 15)
+
+    -- Add keymaps for applying/rejecting
+    vim.api.nvim_buf_set_keymap(buf, "n", "<CR>", ":lua require('zeke').apply_current_diff()<CR>", {
+        noremap = true,
+        silent = true,
+        desc = "Apply diff",
+    })
+
+    vim.api.nvim_buf_set_keymap(buf, "n", "q", ":close<CR>", {
+        noremap = true,
+        silent = true,
+        desc = "Reject diff",
+    })
+
+    return buf, win
+end
+
+-- Extract code blocks from AI response
+function M.extract_code_blocks(response)
+    local blocks = {}
+
+    -- Match ```language\ncode\n```
+    for language, code in response:gmatch("```([%w]*)\n(.-)```") do
+        table.insert(blocks, {
+            language = language ~= "" and language or "text",
+            code = code,
+        })
+    end
+
+    return blocks
+end
+
+-- Generate patch from code blocks
+function M.generate_patch_from_blocks(original, blocks, filepath)
+    if #blocks == 0 then
+        return nil, "No code blocks found in response"
+    end
+
+    -- Use first code block
+    local modified = blocks[1].code
+
+    -- Generate diff
+    return M.create_diff_from_strings(original, modified, filepath)
+end
+
+-- Smart patch application (tries multiple strategies)
+function M.smart_apply(filepath, ai_response)
+    -- Strategy 1: Extract code blocks
+    local blocks = M.extract_code_blocks(ai_response)
+
+    if #blocks > 0 then
+        -- Read original file
+        local file = io.open(filepath, "r")
+        if not file then
+            return false, "Failed to read file"
+        end
+        local original = file:read("*a")
+        file:close()
+
+        -- Generate patch
+        local patch, err = M.generate_patch_from_blocks(original, blocks, filepath)
+        if not patch then
+            return false, err
+        end
+
+        -- Preview diff
+        local preview_buf, preview_win = M.preview_diff(patch)
+
+        -- Store patch for later application
+        vim.b[preview_buf].zeke_patch = patch
+        vim.b[preview_buf].zeke_filepath = filepath
+
+        return true, "Diff preview created (press <CR> to apply, q to reject)"
+    end
+
+    -- Strategy 2: Check if response is already a diff
+    if ai_response:match("^@@") or ai_response:match("^%-%-%-") then
+        local preview_buf, preview_win = M.preview_diff(ai_response)
+
+        vim.b[preview_buf].zeke_patch = ai_response
+        vim.b[preview_buf].zeke_filepath = filepath
+
+        return true, "Diff preview created (press <CR> to apply, q to reject)"
+    end
+
+    return false, "Could not extract applicable diff from response"
+end
+
+-- Apply current diff (called from preview buffer)
+function M.apply_current_diff()
+    local bufnr = vim.api.nvim_get_current_buf()
+    local patch = vim.b[bufnr].zeke_patch
+    local filepath = vim.b[bufnr].zeke_filepath
+
+    if not patch or not filepath then
+        print("[zeke] No patch to apply")
+        return
+    end
+
+    -- Apply patch
+    local success, err = M.apply_patch(filepath, patch)
+
+    if success then
+        print("[zeke] Patch applied successfully")
+        vim.cmd("close")
+
+        -- Reload file in editor
+        vim.cmd("edit! " .. filepath)
+    else
+        print("[zeke] Failed to apply patch: " .. (err or "unknown error"))
+    end
+end
+
+-- Rollback last change
+function M.rollback(filepath)
+    local success, err = restore_backup(filepath)
+
+    if success then
+        print("[zeke] Rolled back changes")
+        vim.cmd("edit! " .. filepath)
+        return true
+    else
+        print("[zeke] " .. err)
+        return false
+    end
+end
+
+-- Check if file has backup
+function M.has_backup(filepath)
+    local backup_path = filepath .. ".zeke.bak"
+    local backup = io.open(backup_path, "r")
+
+    if backup then
+        backup:close()
+        return true
+    end
+
+    return false
+end
+
+return M
